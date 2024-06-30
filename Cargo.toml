@@ -1,0 +1,10 @@
+[package]
+name = "sisyphus"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+chrono = { version = "0.4.38", features = ["serde"] }
+serde = "1.0.203"
+sqlx = "0.7.4"
+toml = "0.8.14"
