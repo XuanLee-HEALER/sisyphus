@@ -1,25 +1,102 @@
+//! classification profiler
+//! 数据分类探针
+//! 根据数据分类结果来计算分类成绩
+//! 数据分类结果为Excel文档，格式为
+//!
+//! |class1|class2|class3|...|classn|数据库|表|字段|
+//! |---|---|---|---|---|----|---|----|
+//! |c1|c2|c3|...|cn|db1|tb1|field1|
+//!
+//! 探针的同级目录应设置为
+//! ```bash
+//! - classification_profiler
+//!   - cls
+//!   - industry
+//!     - bank
+//!       - 银行-结果.xlsx
+//!       - 银行-模版.xlsx
+//! ```
+//!
+//! 部署探针的过程
+//!
+//! `deploy.sh -i <bank> -h`
+//! 1. 使用cls程序，将对应行业的数据分类结果文件加密
+//! 2. 将cls程序，对应行业的加密后数据分类结果文件，模版文件打包，并删除本地加密文件
+//! 3. 将压缩包发送到指定主机位置，sftp
+//! 4. 远程执行命令，解压压缩包并且验证结果文件
+//!
+//! 探针功能
+//! 1. cls -a <分类结果.xlsx>，对比标准答案，生成分类成绩，即总的正确率以及在各大类下的正确率
+//! 2. cls -e <分类结果.xlsx>，将分类结果加密，生成加密文件enc
+
 use std::{
     cmp::Ordering,
+    collections::{HashMap, HashSet},
     error::Error,
-    fmt::{Debug, Display},
+    fmt::Display,
     fs,
-    io::{self, BufRead, BufReader, Write},
+    io::{BufReader, Cursor, Read, Write},
     path::PathBuf,
 };
 
 use aes_gcm::{
-    aead::{Aead, Nonce},
-    Aes256Gcm, Key, KeyInit,
+    aead::{Aead, OsRng},
+    AeadCore, Aes256Gcm, Key, KeyInit,
 };
 use anyhow::Context;
-use calamine::{open_workbook, DataType, Reader, Xlsx};
+use calamine::{open_workbook, open_workbook_from_rs, DataType, Reader, Xlsx};
+use clap::{arg, value_parser, Command};
+use serde::{ser::SerializeTupleStruct, Serialize};
 
-const ENC_FILE_PATH: &str = "./enc";
+const ENC_FILE_PATH: &str = "./fix_e";
 const ENC_KEY: &[u8; 32] = &[
     232, 222, 212, 202, 166, 177, 188, 199, 87, 34, 44, 10, 102, 1, 9, 0, 32, 22, 22, 20, 136, 177,
     128, 199, 87, 32, 44, 10, 102, 2, 4, 6,
 ];
 const CLASSI_SHEET: &str = "Sheet 1";
+const NONCE_LEN: usize = 96 / 8;
+
+#[derive(Serialize, Debug, Default)]
+struct DiffUnit {
+    classis: Vec<String>,
+    field: String,
+    field_exist: bool,
+}
+
+type DiffResult = Vec<DiffUnit>;
+
+fn claussi_report(r: &DiffResult) -> anyhow::Result<()> {
+    let json_res = serde_json::to_string_pretty(&r)?;
+
+    let total = r.len() as i32;
+    let mut match_classi = 0;
+    let mut group_statistic = HashMap::<String, (i32, i32)>::new();
+    for unit in r {
+        let first_classi = unit.classis[0].clone();
+        let cal_u = if unit.field_exist { 1 } else { 0 };
+        match_classi += cal_u;
+        group_statistic
+            .entry(first_classi)
+            .and_modify(|e| {
+                e.0 += 1;
+                e.1 += cal_u;
+            })
+            .or_insert((1, cal_u));
+    }
+
+    let ratio = match_classi as f64 / total as f64;
+    println!("total classification accuracy: {:.2}%", ratio * 100f64);
+
+    for (k, v) in group_statistic {
+        println!(
+            "classification [{}] accuracy: {:.2}%",
+            k,
+            v.1 as f64 / v.0 as f64 * 100f64
+        );
+    }
+
+    Ok(())
+}
 
 #[derive(Debug)]
 struct ClassiError {
@@ -44,7 +121,7 @@ type Database = String;
 type Table = String;
 type Field = String;
 
-#[derive(Debug, PartialEq, Eq, Clone)]
+#[derive(Debug, PartialEq, Eq, Clone, Default, Hash)]
 struct FieldMeta(Database, Table, Field);
 
 impl Display for FieldMeta {
@@ -53,11 +130,34 @@ impl Display for FieldMeta {
     }
 }
 
+impl Serialize for FieldMeta {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut ser = serializer.serialize_tuple_struct("field", 3)?;
+        ser.serialize_field(&self.0)?;
+        ser.serialize_field(&self.1)?;
+        ser.serialize_field(&self.2)?;
+        ser.end()
+    }
+}
+
 #[derive(Debug, PartialEq, Eq, Clone)]
 enum ClassiVal {
     Root,
     Classi(String),
     Field(FieldMeta),
+}
+
+impl Display for ClassiVal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ClassiVal::Root => write!(f, "root"),
+            ClassiVal::Classi(ref s) => write!(f, "classi({})", s),
+            ClassiVal::Field(ref dtf) => write!(f, "field({})", dtf),
+        }
+    }
 }
 
 struct ClassiNode {
@@ -229,6 +329,79 @@ impl ClassiTree {
             }
         }
     }
+
+    fn all_leaves(&self) -> Vec<Vec<&ClassiNode>> {
+        let mut res = Vec::new();
+
+        let mut cur_q = Vec::<&ClassiNode>::new();
+        if let Some(ref subs) = self.root.subs {
+            for sub in subs {
+                ClassiTree::_collect_leave(sub, &mut cur_q, &mut res);
+                cur_q.clear();
+            }
+        }
+        res
+    }
+
+    fn _collect_leave<'a>(
+        node: &'a ClassiNode,
+        cur_q: &mut Vec<&'a ClassiNode>,
+        res: &mut Vec<Vec<&'a ClassiNode>>,
+    ) {
+        cur_q.push(node);
+        if let Some(ref subs) = node.subs {
+            for sub in subs {
+                ClassiTree::_collect_leave(sub, cur_q, res);
+            }
+            cur_q.pop();
+        } else {
+            res.push(cur_q.clone());
+            cur_q.pop();
+        }
+    }
+
+    /// 和另一棵分类结果树做对比，生成对比结果
+    fn diff(&self, other: &ClassiTree) -> DiffResult {
+        let all_fields = self.all_leaves();
+        let mut res = Vec::new();
+        for field in all_fields {
+            let mut t_q = Vec::new();
+            let mut is_found = true;
+            for seg in &field {
+                match other.find_node(&seg.val) {
+                    Some(node) => match node.val {
+                        ClassiVal::Classi(ref classi) => t_q.push(classi.clone()),
+                        ClassiVal::Field(ref field) => {
+                            let unit = DiffUnit {
+                                classis: t_q.clone(),
+                                field: field.to_string(),
+                                field_exist: true,
+                            };
+                            res.push(unit);
+                        }
+                        _ => (),
+                    },
+                    None => is_found = false,
+                }
+            }
+            if !is_found {
+                let unit = DiffUnit {
+                    classis: field[0..field.len()]
+                        .iter()
+                        .map(|n| match &n.val {
+                            ClassiVal::Classi(classi) => classi.clone(),
+                            _ => String::new(),
+                        })
+                        .collect(),
+                    field: field.last().unwrap().val.to_string(),
+                    field_exist: false,
+                };
+                res.push(unit);
+            }
+        }
+
+        res
+    }
 }
 
 impl Display for ClassiTree {
@@ -237,17 +410,37 @@ impl Display for ClassiTree {
     }
 }
 
-/// 在工作目录生成一个Excel结果模版
-fn generate_result_tmpl() -> Result<(), io::Error> {
-    Ok(())
+fn new_workbook_from_file(file_path: &PathBuf) -> anyhow::Result<Xlsx<BufReader<fs::File>>> {
+    let workbook: Xlsx<_> = open_workbook(file_path)?;
+    Ok(workbook)
 }
 
-fn read_classi_result(file_path: &PathBuf) -> anyhow::Result<String> {
-    let mut workbook: Xlsx<_> = open_workbook(file_path)
-        .with_context(|| format!("failed to open the excel file {:?}", file_path))?;
-    let sheet = workbook
-        .worksheet_range(CLASSI_SHEET)
-        .with_context(|| format!("failed to open the sheet [{}]", CLASSI_SHEET))?;
+fn new_workbook_from_bytes(bytes: &Vec<u8>) -> anyhow::Result<Xlsx<Cursor<&Vec<u8>>>> {
+    let cursor = Cursor::new(bytes);
+    let workbook: Xlsx<_> = open_workbook_from_rs(cursor)?;
+    Ok(workbook)
+}
+
+/// 读取分类结果，转化为分类树
+fn read_classi_result(file_path: &PathBuf, is_enc: bool) -> anyhow::Result<ClassiTree> {
+    let sheet = if is_enc {
+        let decrypt_result = decrypt_file(file_path).with_context(|| {
+            format!(
+                "failed to decrypt the standard answer file [{}]",
+                file_path.to_string_lossy()
+            )
+        })?;
+        let mut workbook = new_workbook_from_bytes(&decrypt_result)?;
+        workbook
+            .worksheet_range(CLASSI_SHEET)
+            .with_context(|| format!("failed to open the sheet [{}]", CLASSI_SHEET))?
+    } else {
+        let mut workbook = new_workbook_from_file(file_path)?;
+        workbook
+            .worksheet_range(CLASSI_SHEET)
+            .with_context(|| format!("failed to open the sheet [{}]", CLASSI_SHEET))?
+    };
+
     let headers = sheet
         .headers()
         .ok_or(ClassiError::new("failed to retrieve the header"))?;
@@ -271,15 +464,14 @@ fn read_classi_result(file_path: &PathBuf) -> anyhow::Result<String> {
     let range = sheet.range((1, 0), (maybe_row_len as u32, classi_counter as u32 + 2));
 
     let mut tree = ClassiTree::new();
+    let mut field_filter = HashSet::<FieldMeta>::new();
 
-    'out: for row in range.rows() {
+    for row in range.rows() {
         if row.len() != classi_counter + 3 {
             break;
         } else {
-            for v in row {
-                if v.is_empty() || !v.is_string() {
-                    break 'out;
-                }
+            if row.is_empty() || row.first().unwrap().is_empty() {
+                continue;
             }
 
             let mut lvls = vec![];
@@ -289,158 +481,79 @@ fn read_classi_result(file_path: &PathBuf) -> anyhow::Result<String> {
             let db = String::from(row.get(classi_counter).unwrap().get_string().unwrap());
             let tb = String::from(row.get(classi_counter + 1).unwrap().get_string().unwrap());
             let fd = String::from(row.get(classi_counter + 2).unwrap().get_string().unwrap());
-            // println!("parameters:\n{:?} {}", lvls, FieldMeta(db, tb, fd));
-            tree.add_node(&lvls, FieldMeta(db, tb, fd))?;
+            let field_meta = FieldMeta(db, tb, fd);
+            if field_filter.contains(&field_meta) {
+                return Err(ClassiError::new("duplicated field detected").into());
+            } else {
+                field_filter.insert(field_meta.clone());
+            }
+
+            tree.add_node(&lvls, field_meta)?;
         }
     }
 
-    println!("{}", tree);
-
-    Ok(String::from("value"))
+    Ok(tree)
 }
 
 /// 读取结果并将结果文件加密转存
-fn encrypt_result(result_file: &PathBuf, enc_file: Option<&PathBuf>) -> Result<(), io::Error> {
-    // opens a new workbook
-
-    // let mut enc_path = &PathBuf::from(ENC_FILE_PATH);
-    // if let Some(dst) = enc_file {
-    //     enc_path = dst;
-    // }
-    // let mut enc_file = fs::File::create(enc_path)?;
-    // let key: &Key<Aes256Gcm> = ENC_KEY.into();
-    // let cipher = Aes256Gcm::new(key);
-
-    // 'out: for row in range.rows() {
-    //     if !row.is_empty() {
-    //         match row.first() {
-    //             Some(Data::String(_)) => {
-    //                 let cols: Vec<String> = row.iter().map_while(|d| d.as_string()).collect();
-    //                 let line = cols.join(",");
-    //                 let plain_text = line.as_bytes();
-    //                 let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
-    //                 match cipher.encrypt(&nonce, plain_text) {
-    //                     Ok(mut cipher_text) => {
-    //                         cipher_text.push(b'|');
-    //                         cipher_text.append(nonce.to_vec().as_mut());
-    //                         cipher_text.push(b'\n');
-    //                         let _ = enc_file.write(&cipher_text)?;
-    //                     }
-    //                     Err(e) => {
-    //                         return Err(io::Error::new(io::ErrorKind::Other, e.to_string()));
-    //                     }
-    //                 }
-    //             }
-    //             _ => break 'out,
-    //         }
-    //     } else {
-    //         break;
-    //     }
-    // }
-
+fn encrypt_file(ori_file: &PathBuf, enc_file: &PathBuf) -> anyhow::Result<()> {
+    let ori_file = fs::read(ori_file)?;
+    let key: &Key<Aes256Gcm> = ENC_KEY.into();
+    let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+    let cipher = Aes256Gcm::new(key);
+    let cipher_content = cipher
+        .encrypt(&nonce, ori_file.as_ref())
+        .map_err(|e| anyhow::Error::msg(e.to_string()))?;
+    let mut enc_file = fs::File::create(enc_file)?;
+    let nonce_len = enc_file.write(&nonce)?;
+    if nonce_len != nonce.len() {
+        return Err(anyhow::Error::msg("failed to write the nonce"));
+    }
+    let _ = enc_file.write(&cipher_content)?;
     Ok(())
 }
 
-fn read_enc_file(file_path: &PathBuf) -> Result<Vec<String>, io::Error> {
-    let enc_file = fs::File::open(file_path)?;
-    let enc_file = BufReader::new(enc_file);
-
+/// 读取加密文件内容
+fn decrypt_file(enc_file: &PathBuf) -> anyhow::Result<Vec<u8>> {
     let key: &Key<Aes256Gcm> = ENC_KEY.into();
     let cipher = Aes256Gcm::new(key);
-    let mut rec = Vec::new();
 
-    for line in enc_file.lines() {
-        let line = line?;
-        let segs: Vec<&str> = line.split('|').collect();
-        if segs.len() != 2 {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                "inline delimiter not found",
-            ));
-        } else {
-            let encrypt_text: &[u8] = segs[0].as_bytes();
-            let nonce: &[u8] = segs[1].as_bytes();
-            let nonce: &Nonce<Aes256Gcm> = nonce.into();
-            match cipher.decrypt(nonce, encrypt_text) {
-                Ok(decrypt_text) => match String::from_utf8(decrypt_text) {
-                    Ok(dec_str) => {
-                        rec.push(dec_str);
-                    }
-                    Err(e) => {
-                        return Err(io::Error::new(io::ErrorKind::Other, e));
-                    }
-                },
-                Err(e) => {
-                    return Err(io::Error::new(io::ErrorKind::Other, e.to_string()));
-                }
-            }
-        }
-    }
+    let mut enc_file = fs::File::open(enc_file)?;
+    let mut buf = Vec::new();
+    let _ = enc_file.read_to_end(&mut buf)?;
+    let nonce = &buf[..NONCE_LEN];
+    let cipher_content = &buf[NONCE_LEN..];
 
-    Ok(rec)
-}
-
-struct ClassificationReport {}
-
-/// 读取Excel结果并与正确答案比对，生成一个分类结果报告
-fn generate_report() -> ClassificationReport {
-    ClassificationReport {}
+    let plain_content = cipher
+        .decrypt(nonce.into(), cipher_content)
+        .map_err(|e| anyhow::Error::msg(e.to_string()))?;
+    Ok(plain_content)
 }
 
 fn main() -> anyhow::Result<()> {
-    // let enc_file = PathBuf::from("./enc.txt");
-    // let ori = read_enc_file(&enc_file).map_err(ClsError::OtherError)?;
-    // for o in ori {
-    //     println!("original text: {}", o);
-    // }
-    let _ = read_classi_result(&PathBuf::from("./test.xlsx")).expect("error occurred");
+    let matches = Command::new("cls_profiler")
+        .about("数据分类探针")
+        .version("1.0.0")
+        .args([
+            arg!(answer: -a --answer <FILE> "指定分类结果文件的路径")
+                .value_parser(value_parser!(PathBuf)),
+            arg!(encrypt: -e --encrypt <FILE> "指定要加密的分类结果文件的路径")
+                .value_parser(value_parser!(PathBuf)),
+        ])
+        .arg_required_else_help(true)
+        .get_matches();
 
-    // let matches = Command::new("cls_profiler")
-    // .about("分类探针应用")
-    // .version("1.0.0")
-    // .subcommand(
-    //     Command::new("restmpl")
-    //     .about("生成分类结果模版")
-    //     .arg(arg!(-t --tmpl [tmpl_path] "，tmpl_path为模版的生成路径，需要一个程序有写入权限的路径，不填默认为工作目录"))
-    // )
-    // .subcommand(
-    //     Command::new("encrypt")
-    //     .about("加密结果文件")
-    //     .arg(arg!(-e --enc <result> "result为需要加密的结果文件的具体路径，文件格式为xlsx").required(true).value_parser(value_parser!(PathBuf)))
-    //     .arg(arg!(-p [enc_result_path] "enc_result_path为目标文件的生成路径，需要一个程序有写入权限的路径，不填默认为工作目录")),
-    // )
-    // .subcommand(
-    //     Command::new("report")
-    //     .about("生成分类结果报告")
-    //     .arg(arg!(-r <result_path> "result_path是分类结果").required(true))
-    //     .arg(arg!(-e <encrypted_result_path> "encrypted_result_path是加密的正确分类结果").required(true))
-    //     .arg(arg!(-o <out_fmt> "out_fmt指定输出目标，CONSOLE为标准输出，PDF为pdf文件").required(true).value_parser(["CONSOLE", "PDF"]))
-    //     .arg(arg!(-p [report_path] "report_path指定一个有写入权限的目录，默认为工作目录")),
-    // )
-    // .subcommand_required(true)
-    // .get_matches();
+    if let Some(ef) = matches.get_one::<PathBuf>("encrypt") {
+        encrypt_file(ef, &PathBuf::from(ENC_FILE_PATH))?;
+    }
 
-    // if let Some(enc) = matches.subcommand_matches("encrypt") {
-    //     if let Some(result_path) = enc.get_one::<PathBuf>("enc") {
-    //         let enc_path = enc
-    //             .get_one("enc_result_path")
-    //             .map(|ep: &String| PathBuf::from(ep));
-    //         return match encrypt_result(result_path, enc_path.as_ref()) {
-    //             Ok(()) => Ok(()),
-    //             Err(e) => Err(Box::new(e)),
-    //         };
-    //     } else {
-    //         return Err(Box::new(ClsError::InternalError));
-    //     }
-    // }
-
-    // if let Some(report) = matches.subcommand_matches("report") {
-    //     if let Some(result_path) = report.get_one::<String>("result_path") {
-    //         println!("result_path => {}", result_path)
-    //     } else {
-    //         return Err(Box::new(ClsError::InternalError));
-    //     }
-    // }
+    if let Some(af) = matches.get_one::<PathBuf>("answer") {
+        let solution_file = PathBuf::from(ENC_FILE_PATH);
+        let solution = read_classi_result(&solution_file, true)?;
+        let answer = read_classi_result(af, false)?;
+        let diff_res: DiffResult = solution.diff(&answer);
+        claussi_report(&diff_res)?;
+    }
 
     Ok(())
 }
